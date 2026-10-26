@@ -1,50 +1,70 @@
-name: Simple YouTube Live Stream
+import os
+import subprocess
+import re
 
-on:
-  workflow_dispatch:
+# உங்கள் கூகுள் டிரைவ் வீடியோ லிங்க்குகள்
+video_links = [
+    "https://drive.google.com/file/d/1hkKADV8rIPaL-I89-ZzQMgUQuBTE7ECb/view?usp=drivesdk",
+    "https://drive.google.com/file/d/1qt12K54QvY6bhI0IUhngi9_rudBYyDxe/view?usp=drivesdk",
+    "https://drive.google.com/file/d/1B3J2cpFPB6Uv7Ym61atAGXK-NhBM5Ap4/view?usp=drivesdk",
+    "https://drive.google.com/file/d/1H-VSfWm6ZiruBx3ZHbaLBGtCXr6lScrD/view?usp=drivesdk"
+]
 
-jobs:
-  stream:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+stream_key = os.environ.get("STREAM_KEY")
+rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
 
-      - name: Install Tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-pip
-          pip3 install gdown
+def extract_id(link):
+    match = re.search(r'/d/([a-zA-Z0-9_-]+)', link)
+    return match.group(1) if match else None
 
-      - name: Download Files Without Errors
-        run: |
-          # Robust download function handling Google Drive permissions and large files
-          dl_drive() {
-            FILE_ID=$1
-            OUTPUT=$2
-            gdown "https://drive.google.com/uc?id=${FILE_ID}" -O "${OUTPUT}" || \
-            curl -Lb cookies.txt "https://docs.google.com/uc?export=download&confirm=t&id=${FILE_ID}" -o "${OUTPUT}"
-          }
+def download_and_prepare():
+    downloaded_files = []
+    
+    # 1. வீடியோக்களை டவுன்லோட் செய்தல்
+    for i, link in enumerate(video_links):
+        file_id = extract_id(link)
+        if not file_id:
+            continue
+        output_file = f"video_{i}.mp4"
+        print(f"Downloading Video {i+1}...")
+        cmd = ["yt-dlp", "-o", output_file, f"https://drive.google.com/uc?id={file_id}"]
+        subprocess.run(cmd)
+        
+        if os.path.exists(output_file):
+            # வீடியோவின் அளவை 16:9-க்கு மாற்றி தற்காலிக ஃபைலாக சேமித்தல்
+            converted_file = f"ready_{i}.mp4"
+            print(f"Converting Video {i+1} to standard format...")
+            convert_cmd = [
+                "ffmpeg", "-y", "-i", output_file,
+                "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                converted_file
+            ]
+            subprocess.run(convert_cmd)
+            downloaded_files.append(converted_file)
 
-          echo "--- DOWNLOADING ASSETS ---"
-          # 1. Video Download
-          dl_drive "184Mkv-aOszZ8fzQtD9SL0_8768a5xI2f" "video.mp4"
+    # 2. பிளேலிஸ்ட் ஃபைல் உருவாக்குதல் (Concat Text File)
+    if downloaded_files:
+        with open("playlist.txt", "w") as f:
+            for file in downloaded_files:
+                f.write(f"file '{file}'\n")
+        return True
+    return False
 
-          # 2. Logo Download (Updated Link)
-          dl_drive "1WEu_-Z84_a8jXSsRaL_KBFgiJOTXbqp7" "logo.png"
+def stream_playlist():
+    print("Starting continuous live stream from playlist...")
+    # Concat demuxer மூலம் அனைத்து வீடியோக்களையும் ஒன்றன் பின் ஒன்றாகத் தொடர்ச்சியாக (Loop-ல்) ஸ்ட்ரீம் செய்தல்
+    ffmpeg_cmd = [
+        "ffmpeg", "-re", "-f", "concat", "-safe", "0", "-stream_loop", "-1", "-i", "playlist.txt",
+        "-c:v", "libx264", "-preset", "veryfast", "-b:v", "3000k",
+        "-maxrate", "3000k", "-bufsize", "6000k",
+        "-pix_fmt", "yuv420p", "-g", "60",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-f", "flv", rtmp_url
+    ]
+    subprocess.run(ffmpeg_cmd)
 
-      - name: Start Live Stream to YouTube
-        run: |
-          STREAM_KEY="${{ secrets.YOUTUBE_STREAM_KEY }}"
-          STREAM_URL="rtmp://a.rtmp.youtube.com/live2"
-
-          # Stream video in a continuous loop with top-left corner logo overlay
-          ffmpeg -re \
-          -stream_loop -1 -i video.mp4 \
-          -i logo.png \
-          -filter_complex "[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(1280-iw)/2:(720-ih)/2:black,fps=30[scaled];[1:v]scale=80:-1[slogo];[scaled][slogo]overlay=30:30[v]" \
-          -map "[v]" -map 0:a? \
-          -c:v libx264 -preset ultrafast -b:v 2500k -maxrate 2500k -bufsize 5000k \
-          -pix_fmt yuv420p -g 60 \
-          -c:a aac -b:a 128k -ar 44100 \
-          -f flv "$STREAM_URL/$STREAM_KEY"
+if __name__ == "__main__":
+    if download_and_prepare():
+        stream_playlist()
